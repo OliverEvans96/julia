@@ -3903,8 +3903,27 @@ function get_spec_lambda(atypes::ANY, sv, invoke_data::ANY)
     end
 end
 
-function invoke_NF(argexprs, etype::ANY, atypes, sv, atype_unlimited::ANY,
-                   invoke_data::ANY)
+function linearize_args!(args::Vector{Any}, atypes::Vector{Any}, stmts::Vector{Any}, sv::InferenceState)
+    # linearize the IR by moving the arguments to SSA position
+    na = length(args)
+    @assert length(atypes) == na
+    newargs = Vector{Any}(na)
+    for i = na:-1:1
+        aei = args[i]
+        ti = atypes[i]
+        if isa(aei, Expr) || isa(aei, GlobalRef)
+            newvar = newvar!(sv, ti)
+            unshift!(stmts, Expr(:(=), newvar, aei))
+        else
+            newvar = aei
+        end
+        newargs[i] = newvar
+    end
+    return newargs
+end
+
+function invoke_NF(argexprs, etype::ANY, atypes::Vector{Any}, sv::InferenceState,
+                   atype_unlimited::ANY, invoke_data::ANY)
     # converts a :call to :invoke
     nu = countunionsplit(atypes)
     nu > sv.params.MAX_UNION_SPLITTING && return NF
@@ -3918,12 +3937,16 @@ function invoke_NF(argexprs, etype::ANY, atypes, sv, atype_unlimited::ANY,
     end
 
     if nu > 1
+        # linearize the IR by moving the arguments to SSA position
+        stmts = []
+
         spec_miss = nothing
         error_label = nothing
         ex = Expr(:call)
-        ex.args = copy(argexprs)
         ex.typ = etype
-        stmts = []
+        ex.args = linearize_args!(argexprs, atypes, stmts, sv)
+        invoke_texpr === nothing || insert!(stmts, 2, invoke_texpr)
+        invoke_fexpr === nothing || unshift!(stmts, invoke_fexpr)
 
         local ret_var, merge, invoke_ex, spec_hit
         ret_var = add_slot!(sv.src, widenconst(etype), false)
@@ -3933,26 +3956,6 @@ function invoke_NF(argexprs, etype::ANY, atypes, sv, atype_unlimited::ANY,
         unshift!(invoke_ex.args, nothing)
         spec_hit = false
 
-        # linearize the IR by moving the arguments to SSA position
-        for i = length(atypes):-1:1
-            if i == 1 && !(invoke_texpr === nothing)
-                unshift!(stmts, invoke_texpr)
-            end
-            ti = atypes[i]
-            aei = ex.args[i]
-            if !isa(aei, Slot) &&
-                  !isa(aei, SSAValue) &&
-                  !isa(aei, Symbol) &&
-                  !isa(aei, QuoteNode) &&
-                  !isa(aei, Int) &&
-                  !isa(aei, Type) &&
-                  !isa(aei, GlobalRef)
-                newvar = newvar!(sv, ti)
-                unshift!(stmts, :($newvar = $aei))
-                ex.args[i] = newvar
-            end
-        end
-        invoke_fexpr === nothing || unshift!(stmts, invoke_fexpr)
         function splitunion(atypes::Vector{Any}, i::Int)
             if i == 0
                 local sig = argtypes_to_type(atypes)
@@ -4020,6 +4023,7 @@ function invoke_NF(argexprs, etype::ANY, atypes, sv, atype_unlimited::ANY,
         local cache_linfo = get_spec_lambda(atype_unlimited, sv, invoke_data)
         cache_linfo === nothing && return NF
         add_backedge!(cache_linfo, sv)
+        argexprs = copy(argexprs)
         unshift!(argexprs, cache_linfo)
         ex = Expr(:invoke)
         ex.args = argexprs
@@ -4206,6 +4210,7 @@ function inlineable(f::ANY, ft::ANY, e::Expr, atypes::Vector{Any}, sv::Inference
     end
 
     argexprs0 = argexprs
+    atypes0 = atypes
     na = Int(method.nargs)
     # check for vararg function
     isva = false
@@ -4214,6 +4219,7 @@ function inlineable(f::ANY, ft::ANY, e::Expr, atypes::Vector{Any}, sv::Inference
         # construct tuple-forming expression for argument tail
         vararg = mk_tuplecall(argexprs[na:end], sv)
         argexprs = Any[argexprs[1:(na - 1)]..., vararg]
+        atypes = Any[atypes[1:(na - 1)]..., vararg.typ]
         isva = true
     elseif na != length(argexprs)
         # we have a method match only because an earlier
@@ -4253,7 +4259,7 @@ function inlineable(f::ANY, ft::ANY, e::Expr, atypes::Vector{Any}, sv::Inference
 
     # see if the method has been previously inferred (and cached)
     linfo = code_for_method(method, metharg, methsp, sv.params.world, !force_infer) # Union{Void, MethodInstance}
-    isa(linfo, MethodInstance) || return invoke_NF(argexprs0, e.typ, atypes, sv,
+    isa(linfo, MethodInstance) || return invoke_NF(argexprs0, e.typ, atypes0, sv,
                                                    atype_unlimited, invoke_data)
     linfo = linfo::MethodInstance
     if linfo.jlcall_api == 2
@@ -4323,7 +4329,7 @@ function inlineable(f::ANY, ft::ANY, e::Expr, atypes::Vector{Any}, sv::Inference
         src_inlineable = ccall(:jl_ast_flag_inlineable, Bool, (Any,), inferred)
     end
     if !src_inferred || !src_inlineable
-        return invoke_NF(argexprs0, e.typ, atypes, sv, atype_unlimited,
+        return invoke_NF(argexprs0, e.typ, atypes0, sv, atype_unlimited,
                          invoke_data)
     end
 
@@ -4350,7 +4356,7 @@ function inlineable(f::ANY, ft::ANY, e::Expr, atypes::Vector{Any}, sv::Inference
             if inline_worthy_stmts(current_stmts)
                 append!(current_stmts, ast)
                 if !inline_worthy_stmts(current_stmts)
-                    return invoke_NF(argexprs0, e.typ, atypes, sv, atype_unlimited,
+                    return invoke_NF(argexprs0, e.typ, atypes0, sv, atype_unlimited,
                                      invoke_data)
                 end
             end
@@ -4388,46 +4394,9 @@ function inlineable(f::ANY, ft::ANY, e::Expr, atypes::Vector{Any}, sv::Inference
     prelude_stmts = []
     stmts_free = true # true = all entries of stmts are effect_free
 
-    for i = na:-1:1 # stmts_free needs to be calculated in reverse-argument order
-        #args_i = args[i]
-        aei = argexprs[i]
-        aeitype = argtype = widenconst(exprtype(aei, sv.src, sv.mod))
-        if i == 1 && !(invoke_texpr === nothing)
-            unshift!(prelude_stmts, invoke_texpr)
-        end
-
-        # ok for argument to occur more than once if the actual argument
-        # is a symbol or constant, or is not affected by previous statements
-        # that will exist after the inlining pass finishes
-        affect_free = stmts_free  # false = previous statements might affect the result of evaluating argument
-        occ = 0
-        for j = length(body.args):-1:1
-            b = body.args[j]
-            if occ < 6
-                occ += occurs_more(b, x->(isa(x, Slot) && slot_id(x) == i), 6)
-            end
-            if occ > 0 && affect_free && !effect_free(b, src, method.module, true)
-                #TODO: we might be able to short-circuit this test better by memoizing effect_free(b) in the for loop over i
-                affect_free = false
-            end
-            if occ > 5 && !affect_free
-                break
-            end
-        end
-        free = effect_free(aei, sv.src, sv.mod, true)
-        if ((occ==0 && aeitype===Bottom) || (occ > 1 && !inline_worthy(aei, occ*2000)) ||
-                (affect_free && !free) || (!affect_free && !effect_free(aei, sv.src, sv.mod, false)))
-            if occ != 0
-                vnew = newvar!(sv, aeitype)
-                argexprs[i] = vnew
-                unshift!(prelude_stmts, Expr(:(=), vnew, aei))
-                stmts_free &= free
-            elseif !free && !isType(aeitype)
-                unshift!(prelude_stmts, aei)
-                stmts_free = false
-            end
-        end
-    end
+    # linearize the IR by moving the arguments to SSA position
+    argexprs = linearize_args!(argexprs, atypes, prelude_stmts, sv)
+    invoke_texpr === nothing || insert!(prelude_stmts, 2, invoke_texpr)
     invoke_fexpr === nothing || unshift!(prelude_stmts, invoke_fexpr)
 
     # re-number the SSAValues and copy their type-info to the new ast
@@ -4478,19 +4447,18 @@ function inlineable(f::ANY, ft::ANY, e::Expr, atypes::Vector{Any}, sv::Inference
     local retval
     multiret = false
     lastexpr = pop!(body.args)
-    if isa(lastexpr,LabelNode)
+    if isa(lastexpr, LabelNode)
         push!(body.args, lastexpr)
         push!(body.args, Expr(:call, GlobalRef(topmod, :error), "fatal error in type inference (lowering)"))
         lastexpr = nothing
-    elseif !(isa(lastexpr,Expr) && lastexpr.head === :return)
+    elseif !(isa(lastexpr, Expr) && lastexpr.head === :return)
         # code sometimes ends with a meta node, e.g. inbounds pop
         push!(body.args, lastexpr)
         lastexpr = nothing
     end
     for a in body.args
         push!(stmts, a)
-        if isa(a,Expr)
-            a = a::Expr
+        if isa(a, Expr)
             if a.head === :return
                 if !multiret
                     # create slot first time
@@ -4580,7 +4548,7 @@ function inlineable(f::ANY, ft::ANY, e::Expr, atypes::Vector{Any}, sv::Inference
         end
     end
 
-    if isa(expr,Expr)
+    if isa(expr, Expr)
         old_t = e.typ
         if old_t ⊑ expr.typ
             # if we had better type information than the content being inlined,
@@ -4618,10 +4586,10 @@ function inline_worthy(body::Expr, cost::Integer=1000) # precondition: 0 < cost;
             nstmt += 1
         end
     end
-    if nstmt < (symlim + 500) ÷ 1000
+    if nstmt < (symlim + 500) ÷ 100
         symlim *= 16
         symlim ÷= 1000
-        if occurs_more(body, e->!inline_ignore(e), symlim) < symlim
+        if occurs_more(body, e -> !inline_ignore(e), symlim) < symlim
             return true
         end
     end
@@ -5455,6 +5423,8 @@ end
 # TODO can probably be removed when we switch to a linear IR
 function getfield_elim_pass!(sv::InferenceState)
     body = sv.src.code
+    nssavalues = length(sv.src.ssavaluetypes)
+    sv.ssavalue_defs = find_ssavalue_defs(body, nssavalues)
     for i = 1:length(body)
         body[i] = _getfield_elim_pass!(body[i], sv)
     end
@@ -5468,11 +5438,18 @@ function _getfield_elim_pass!(e::Expr, sv::InferenceState)
         (isa(e.args[3],Int) || isa(e.args[3],QuoteNode))
         e1 = e.args[2]
         j = e.args[3]
-        if isa(e1,Expr)
-            alloc = is_allocation(e1, sv)
+        single_use = true
+        while isa(e1, SSAValue)
+            single_use = false
+            def = sv.ssavalue_defs[e1.id + 1]
+            stmt = sv.src.code[def]::Expr
+            e1 = stmt.args[2]
+        end
+        if isa(e1, Expr)
+            alloc = single_use && is_allocation(e1, sv)
             if alloc !== false
                 flen, fnames = alloc
-                if isa(j,QuoteNode)
+                if isa(j, QuoteNode)
                     j = findfirst(fnames, j.value)
                 end
                 if 1 <= j <= flen
@@ -5488,17 +5465,17 @@ function _getfield_elim_pass!(e::Expr, sv::InferenceState)
                     end
                 end
             end
-        elseif isa(e1, GlobalRef) || isa(e1, Symbol) || isa(e1, Slot) || isa(e1, SSAValue)
+        elseif isa(e1, GlobalRef) || isa(e1, Symbol) || isa(e1, Slot)
             # non-self-quoting value
         else
             if isa(e1, QuoteNode)
                 e1 = e1.value
             end
-            if isimmutable(e1) || isa(e1,SimpleVector)
+            if isimmutable(e1) || isa(e1, SimpleVector)
                 # SimpleVector length field is immutable
                 if isa(j, QuoteNode)
                     j = j.value
-                    if !(isa(j,Int) || isa(j,Symbol))
+                    if !(isa(j, Int) || isa(j, Symbol))
                         return e
                     end
                 end
